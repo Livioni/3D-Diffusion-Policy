@@ -1,0 +1,24 @@
+defaults:
+  - dp3
+  - override task: tcp4d
+  - _self_
+dataloader:
+  batch_size: 32
+  num_workers: 4
+val_dataloader:
+  batch_size: 32
+  num_workers: 4
+training:
+  resume: false
+  run_validation: true
+  check_finite_grad: true
+  checkpoint_every: 10
+logging:
+  mode: offline
+  project: dp3-tcp4d-raw
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: val_loss
+    mode: min
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'

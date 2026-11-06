@@ -8,7 +8,6 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from termcolor import cprint
 import copy
 import time
-import pytorch3d.ops as torch3d_ops
 
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.policy.base_policy import BasePolicy
@@ -147,7 +146,7 @@ class DP3(BasePolicy):
         trajectory = torch.randn(
             size=condition_data.shape, 
             dtype=condition_data.dtype,
-            device=condition_data.device)
+            device=condition_data.device, generator=generator)
 
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
@@ -174,7 +173,7 @@ class DP3(BasePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], generator=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -229,6 +228,7 @@ class DP3(BasePolicy):
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
+            generator=generator,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)

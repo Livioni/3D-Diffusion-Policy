@@ -1,0 +1,15 @@
+name: tcp4d
+shape_meta:
+  obs:
+    point_cloud: {shape: [1024, 3], type: point_cloud}
+    agent_pos: {shape: [14], type: low_dim}
+  action: {shape: [14]}
+env_runner: null
+dataset:
+  _target_: diffusion_policy_3d.dataset.tcp4d_dataset.TCP4DDataset
+  zarr_path: ???
+  horizon: ${horizon}
+  pad_before: 1
+  pad_after: 7
+  seed: ${training.seed}
+  val_ratio: 0.1

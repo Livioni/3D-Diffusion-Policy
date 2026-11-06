@@ -198,3 +198,120 @@ If you find our work useful, please consider citing:
 	year={2024}
 }
 ```
+
+## TCP4D：通用双臂训练与 DP3 Server
+
+`TCP4D_Pens_in_cups`、`TCP4D_Stack_bowls` 及相同格式的其他任务共用转换、训练配置和推理服务。
+使用已有 `dp3` conda 环境，训练输入为第三人称传感器原始深度
+`depths/third_person/*.png`，不进行深度补全。以下命令在仓库根目录执行；
+shell 启动器也支持通过绝对路径从其他目录调用。
+
+```bash
+conda run -n dp3 python -m pip install -r scripts/requirements_tcp4d.txt
+# Pens in cups：全量转换 + 两轮短训练，每轮 5 个训练 batch、3 个验证 batch
+bash scripts/train_tcp4d.sh --task TCP4D_Pens_in_cups --smoke-test \
+  --output-dir data/outputs/tcp4d_pens_in_cups_check
+# Pens in cups：正式训练
+bash scripts/train_tcp4d.sh --task TCP4D_Pens_in_cups \
+  --gpu 0 --batch-size 32 --epochs 5000 --output-dir outputs/tcp4d_pens_in_cups
+# Stack bowls：仅更换任务名
+bash scripts/train_tcp4d.sh --task TCP4D_Stack_bowls \
+  --gpu 0 --batch-size 32 --epochs 5000 --output-dir outputs/tcp4d_stack_bowls
+```
+
+`--task` 对应 `datasets/` 下的目录名；也可用 `--data-root /path/to/task` 或
+`--data-root /path/to/task/train_set` 指定数据路径，两者互斥。
+默认任务仍为 `TCP4D_Stack_bowls`，旧的 `train_tcp4d_stack_bowls.sh` 和
+`deploy_tcp4d_stack_bowls.sh` 转发至通用入口，原有命令可继续使用。
+
+转换自动发现 `*__episode_*` 并按编号排序，从 `metadata.json` 读取实际任务名，
+检查所有 episode 属于同一个任务。仅使用 `train_set`，不加入 `eval_set`。
+默认缓存为 `data/<小写任务目录名>_raw.zarr`，例如 `data/tcp4d_pens_in_cups_raw.zarr`；
+默认输出为 `data/outputs/<小写任务目录名>_raw_<时间戳>`，checkpoint 的配置保留任务名。
+可用参数还包括 `--cache`、`--seed`、`--workers` 和 `--prepare-only`。
+缓存记录输入文件大小、时间戳及处理配置，不匹配时请指定新的 `--cache` 路径。
+中断的转换保留 `.partial` 目录，确认后自行删除再重试。
+
+训练默认按完整示教以种子 42 划分训练/验证集，70 条示教划为 63/7；
+验证数据不参与归一化。日志位于输出目录的 `logs.json.txt` 和离线 `wandb/`，
+权重位于 `checkpoints/latest.ckpt` 及按 `val_loss` 择优保留的文件。
+短训练用于测试输入输出链路，正式部署使用充分训练并评估后的权重。
+
+状态和动作均为 14 维：`[左臂六关节, 左夹爪总开距, 右臂六关节, 右夹爪总开距]`。
+关节单位为弧度，夹爪单位为米。训练保留原始动作和同帧对应关系；
+模型输出 8 个动作，步偏移为 `0..7`，不代表固定执行时长。
+
+点云使用已经与第三人称成像平面对齐的 raw Z 深度，`uint16` 毫米制，尺寸 320×240。
+零值剔除，深度范围 0.15–3 米；内参读取 episode 中已修正裁边的 `.npy`。
+外参为 `base_to_camera`，取逆后生成 `footprint` 坐标点云。
+裁剪范围为 x=[0,1.2]、y=[-0.7,0.7]、z=[0.45,1.4] 米；
+固定种子从最多 4096 个候选点最远点采样至 1024 点，不足则重复有效点。
+checkpoint 内包含此规范；server 检查规范并恢复 EMA 权重和训练归一化参数。
+
+启动 DP3 server：
+
+```bash
+bash scripts/deploy_tcp4d.sh \
+  --checkpoint outputs/tcp4d_pens_in_cups/checkpoints/latest.ckpt \
+  --device cuda:0 --host 0.0.0.0 --port 8001
+```
+
+server 只负责接收观测并返回模型预测，不读取数据集、不采集传感器、不连接机器人驱动。
+任务由 checkpoint 决定，无需再指定 `--task`。默认监听 `0.0.0.0:8001`，
+调用端连接 `ws://<server IP>:8001`。还支持 `--gpu`、`--seed`、`--sampling-steps`。
+加载完成后打印 `DP3 server ready`，连接后发送包含任务、输入格式和动作维度的 metadata。
+
+WebSocket 使用二进制 MessagePack。调用端可独立复制
+`3D-Diffusion-Policy/diffusion_policy_3d/deploy/protocol.py`，用 `pack_message` / `unpack_message`
+编解码，仅依赖 numpy 和 msgpack。NumPy 封装为
+`{"__ndarray__": True, "dtype": dtype.str, "shape": [...], "data": bytes}`；消息上限 16 MiB，
+WebSocket 设置 `max_size=16*1024*1024, compression=None`。
+连接后先读取 `type="metadata"` 握手，`protocol_version=1`。
+
+直接发送模型观测：
+
+```python
+request = {
+    "type": "predict",
+    "request_id": "frame-123",
+    "point_cloud": point_cloud,  # float32 [T,1024,3]，米，footprint 坐标系
+    "agent_pos": joint_positions,  # float32 [T,14]，关节弧度 / 夹爪米
+}
+# ws.send(pack_message(request)) 后，unpack_message(ws.recv()) 得到响应：
+# {"type": "prediction", "success": True, "request_id": "frame-123",
+#  "actions": float32[8,14], "inference_ms": ...}
+```
+
+点云必须遵循上面的训练预处理规范。也可发送原始深度，由 server 使用训练时相同的函数生成点云：
+
+| 原始深度请求字段 | 格式 |
+| --- | --- |
+| `type` / `request_id` | `"predict"` / 字符串或整数 |
+| `depths` | `uint16 [T,240,320]`，毫米 raw depth，0 为无效 |
+| `joint_positions` | 有限数值 `[T,14]`，弧度与米制夹爪 |
+| `intrinsics` | `[3,3]`，对应当前深度尺寸 |
+| `extrinsics` | `[4,4]`，基座到 OpenCV 相机的刚体变换 |
+
+两种输入格式任选其一。T 为 1 或 2，历史从旧到新排列；单帧自动重复至两帧。
+关节状态与点云/深度逐帧同步。server 不保留历史，每次提交完整窗口。
+响应的 `actions` 已反归一化，保持原始关节动作单位与布局；调用端安排动作执行。
+发送 `{"type":"health", "request_id":"ping"}` 可检查就绪状态。
+错误返回 `type="error", success=False, error={code,message}`，同一连接可继续请求。
+每次预测使用固定种子，多连接推理串行执行。
+
+验证命令：
+
+```bash
+conda run -n dp3 python -m pytest tests/test_tcp4d.py -q
+# 加载 Pens in cups checkpoint，验证 raw depth / 直接点云预测和 WebSocket 返回一致
+TCP4D_CHECKPOINT=data/outputs/tcp4d_pens_in_cups_verified/checkpoints/latest.ckpt \
+  conda run -n dp3 python -m pytest tests/test_tcp4d.py -q -s
+# 测试其他数据集的 checkpoint 时，用 TCP4D_EPISODE 指定对应 episode 目录
+```
+
+2026-11-05 本机验证：Pens in cups 的 70 条示教、21,191 帧全部转换完成，缓存约 218 MiB。
+两轮短训练已完成，checkpoint 位于
+`data/outputs/tcp4d_pens_in_cups_verified/checkpoints/latest.ckpt`，仅用于链路验证。
+10 项测试全部通过，包括真实 GPU 推理、两种输入格式的一致性、WebSocket 错误恢复；
+通用 server 启动器也通过实际启动与健康检查。日志位于该输出目录的
+`smoke_training.log`、`verification.log` 和 `server_startup.log`。

@@ -3,11 +3,13 @@ if __name__ == "__main__":
     import os
     import pathlib
 
-    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
+    ROOT_DIR = str(pathlib.Path(__file__).resolve().parent)
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 
 import os
+import json
+import re
 import hydra
 import torch
 import dill
@@ -87,7 +89,7 @@ class TrainDP3Workspace:
             RUN_CKPT = True
             verbose = False
         
-        RUN_VALIDATION = False # reduce time cost
+        RUN_VALIDATION = cfg.training.get('run_validation', False)
         
         # resume training
         if cfg.training.resume:
@@ -103,6 +105,7 @@ class TrainDP3Workspace:
         assert isinstance(dataset, BaseDataset), print(f"dataset must be BaseDataset, got {type(dataset)}")
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
+        self.preprocess = getattr(dataset, 'preprocess', None)
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -177,7 +180,7 @@ class TrainDP3Workspace:
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
@@ -194,7 +197,11 @@ class TrainDP3Workspace:
                     t1_1 = time.time()
                     raw_loss, loss_dict = self.model.compute_loss(batch)
                     loss = raw_loss / cfg.training.gradient_accumulate_every
+                    if not torch.isfinite(loss):
+                        raise RuntimeError("Non-finite training loss")
                     loss.backward()
+                    if cfg.training.get('check_finite_grad', False) and not all(p.grad is None or torch.isfinite(p.grad).all() for p in self.model.parameters()):
+                        raise RuntimeError("Non-finite gradient")
                     
                     t1_2 = time.time()
 
@@ -229,7 +236,8 @@ class TrainDP3Workspace:
                         print(f" update ema time: {t1_4-t1_3:.3f}")
                         print(f" logging time: {t1_5-t1_4:.3f}")
 
-                    is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                    is_last_batch = (batch_idx == (len(train_dataloader)-1)) or (
+                        cfg.training.max_train_steps is not None and batch_idx >= cfg.training.max_train_steps - 1)
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
                         wandb_run.log(step_log, step=self.global_step)
@@ -270,7 +278,7 @@ class TrainDP3Workspace:
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                            loss, loss_dict = self.model.compute_loss(batch)
+                            loss, loss_dict = policy.compute_loss(batch)
                             val_losses.append(loss)
                             if (cfg.training.max_val_steps is not None) \
                                 and batch_idx >= (cfg.training.max_val_steps-1):
@@ -302,10 +310,12 @@ class TrainDP3Workspace:
             if env_runner is None:
                 step_log['test_mean_score'] = - train_loss
                 
-            # checkpoint
-            if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
+            periodic_checkpoint = (self.epoch % cfg.training.checkpoint_every == 0
+                                   or local_epoch_idx == cfg.training.num_epochs - 1)
+            # Offline validation selects best checkpoints each epoch; latest is periodic.
+            if (periodic_checkpoint or RUN_VALIDATION) and cfg.checkpoint.save_ckpt:
                 # checkpointing
-                if cfg.checkpoint.save_last_ckpt:
+                if cfg.checkpoint.save_last_ckpt and periodic_checkpoint:
                     self.save_checkpoint()
                 if cfg.checkpoint.save_last_snapshot:
                     self.save_snapshot()
@@ -329,9 +339,12 @@ class TrainDP3Workspace:
             # end of epoch
             # log of last step is combined with validation and rollout
             wandb_run.log(step_log, step=self.global_step)
+            with open(log_path, 'a') as log_file:
+                log_file.write(json.dumps({k: float(v) for k,v in step_log.items() if isinstance(v, (int, float, np.number))}) + '\n')
             self.global_step += 1
             self.epoch += 1
             del step_log
+        wandb_run.finish()
 
     def eval(self):
         # load the latest checkpoint
@@ -387,6 +400,7 @@ class TrainDP3Workspace:
         path.parent.mkdir(parents=False, exist_ok=True)
         payload = {
             'cfg': self.cfg,
+            'preprocess': getattr(self, 'preprocess', None),
             'state_dicts': dict(),
             'pickles': dict()
         } 
@@ -416,20 +430,18 @@ class TrainDP3Workspace:
         if tag=='latest':
             return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
         elif tag=='best': 
-            # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
-            # find the best checkpoint
-            checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
-            all_checkpoints = os.listdir(checkpoint_dir)
-            best_ckpt = None
-            best_score = -1e10
-            for ckpt in all_checkpoints:
-                if 'latest' in ckpt:
-                    continue
-                score = float(ckpt.split('test_mean_score=')[1].split('.ckpt')[0])
-                if score > best_score:
-                    best_ckpt = ckpt
-                    best_score = score
-            return pathlib.Path(self.output_dir).joinpath('checkpoints', best_ckpt)
+            checkpoint_dir = pathlib.Path(self.output_dir) / 'checkpoints'
+            monitor = self.cfg.checkpoint.topk.monitor_key
+            pattern = re.compile(re.escape(monitor) + r'=(-?[0-9]+(?:\.[0-9]+)?)\.ckpt$')
+            candidates = []
+            for path in checkpoint_dir.glob('*.ckpt'):
+                match = pattern.search(path.name)
+                if match:
+                    candidates.append((float(match.group(1)), path))
+            if not candidates:
+                raise FileNotFoundError(f'No checkpoint for metric {monitor} in {checkpoint_dir}')
+            select = min if self.cfg.checkpoint.topk.mode == 'min' else max
+            return select(candidates, key=lambda item: item[0])[1]
         else:
             raise NotImplementedError(f"tag {tag} not implemented")
             
